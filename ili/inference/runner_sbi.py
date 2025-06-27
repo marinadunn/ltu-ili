@@ -205,10 +205,44 @@ class SBIRunner(_BaseRunner):
             raise ValueError(
                 f"Model class {self.engine} not supported with SBIRunner.")
 
+    def _save_checkpoint(self, model: NeuralInference, epoch: int, checkpoint_dir: Path):
+        """Save training checkpoint."""
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch}.pt"
+
+        checkpoint = {
+            'epoch': epoch,
+            'model_state': model._neural_net.state_dict(),
+            'optimizer_state': model._optimizer.state_dict(),
+            'train_indices': model.train_indices,
+            'val_indices': model.val_indices,
+            'summary': model.summary
+        }
+
+        torch.save(checkpoint, checkpoint_path)
+        logging.info(f"Saved checkpoint to {checkpoint_path}")
+
+    def _load_checkpoint(self, model: NeuralInference, checkpoint_path: Path):
+        """Load training checkpoint."""
+        checkpoint = torch.load(checkpoint_path)
+
+        model._neural_net.load_state_dict(checkpoint['model_state'])
+        model._optimizer.load_state_dict(checkpoint['optimizer_state'])
+        model.train_indices = checkpoint['train_indices']
+        model.val_indices = checkpoint['val_indices']
+        model.summary = checkpoint['summary']
+
+        logging.info(f"Loaded checkpoint from {checkpoint_path}")
+        return checkpoint['epoch']
+
     def _train_round(self, models: List[NeuralInference],
-                     x: torch.Tensor, theta: torch.Tensor,
-                     proposal: Optional[Distribution]):
+                    x: torch.Tensor, theta: torch.Tensor,
+                    proposal: Optional[Distribution]):
         """Train a single round of inference for an ensemble of models."""
+
+        # Add checkpoint directory to train_args
+        checkpoint_dir = Path(self.train_args.get('checkpoint_dir', 'checkpoints'))
+        checkpoint_interval = self.train_args.get('checkpoint_interval', 5)
 
         # append data to models
         for model in models:
@@ -218,7 +252,7 @@ class SBIRunner(_BaseRunner):
                 model = model.append_simulations(theta, x)
 
         # get all previous simulations
-        starting_round = 0  # NOTE: won't work for SNPE_A, but we don't use it
+        starting_round = 0
         x, _, _ = model.get_simulations(starting_round)
 
         # split into training and validation randomly
@@ -235,12 +269,21 @@ class SBIRunner(_BaseRunner):
         for i, model in enumerate(models):
             logging.info(f"Training model {i+1} / {len(models)}.")
 
+            # Check for existing checkpoints
+            checkpoint_files = sorted(checkpoint_dir.glob(f"checkpoint_epoch_*.pt"))
+            start_epoch = 0
+
+            if checkpoint_files:
+                latest_checkpoint = checkpoint_files[-1]
+                start_epoch = self._load_checkpoint(model, latest_checkpoint) + 1
+                logging.info(f"Resuming training from epoch {start_epoch}")
+
             # hack to initialize sbi model without training (ref. issue #127)
             first_round = False
             if model._neural_net is None:
                 model.train(learning_rate=self.train_args['learning_rate'],
-                            resume_training=False,
-                            max_num_epochs=-1)
+                          resume_training=False,
+                          max_num_epochs=-1)
                 model._epochs_since_last_improvement = 0
                 first_round = True
 
@@ -248,17 +291,25 @@ class SBIRunner(_BaseRunner):
             model.train_indices = train_indices
             model.val_indices = val_indices
 
-            # train
-            if ("NPE" in self.engine) & first_round:
-                model.train(**self.train_args, resume_training=True,
-                            force_first_round_loss=True)
-            else:
-                model.epoch, model._val_log_prob = 0, float("-Inf")
-                model.train(**self.train_args,  resume_training=True)
+            # Modified training loop with checkpointing
+            max_epochs = self.train_args.get('stop_after_epochs', 20)
+            for epoch in range(start_epoch, max_epochs):
+                # train for one epoch
+                if ("NPE" in self.engine) & first_round:
+                    model.train(**self.train_args,
+                              resume_training=True,
+                              force_first_round_loss=True,
+                              max_num_epochs=1)  # Train just one epoch
+                else:
+                    model.train(**self.train_args,
+                              resume_training=True,
+                              max_num_epochs=1)  # Train just one epoch
+
+                # Save checkpoint periodically
+                if (epoch + 1) % checkpoint_interval == 0:
+                    self._save_checkpoint(model, epoch, checkpoint_dir / f"model_{i}")
 
             # duplicate loss record (for backwards compatibility)
-            # this is a mess, sorry
-            # TODO: deprecate in future versions
             if "training_log_probs" in model.summary:
                 model.summary["training_loss"] = \
                     [-1.*x for x in model.summary["training_log_probs"]]
@@ -278,24 +329,113 @@ class SBIRunner(_BaseRunner):
             posteriors.append(model.build_posterior())
             summaries.append(model.summary)
 
-        # ensemble all trained models, weighted by validation loss
+        # ensemble all trained models (rest remains the same)
         val_logprob = torch.tensor(
             [-1.*float(x["best_validation_loss"][-1]) for x in summaries]).to(self.device)
-
-        # Exponentiate with numerical stability
         weights = torch.exp(val_logprob - val_logprob.max())
         weights /= weights.sum()
+
         posterior_ensemble = EnsemblePosterior(
             posteriors=posteriors,
             weights=weights,
             theta_transform=posteriors[0].theta_transform
-        )  # raises warning due to bug in sbi
-
-        # record the name of the ensemble
+        )
         posterior_ensemble.name = self.name
         posterior_ensemble.signatures = self.signatures
 
         return posterior_ensemble, summaries
+
+    # def _train_round(self, models: List[NeuralInference],
+    #                  x: torch.Tensor, theta: torch.Tensor,
+    #                  proposal: Optional[Distribution]):
+    #     """Train a single round of inference for an ensemble of models."""
+
+    #     # append data to models
+    #     for model in models:
+    #         if ("NPE" in self.engine):
+    #             model = model.append_simulations(theta, x, proposal=proposal)
+    #         else:
+    #             model = model.append_simulations(theta, x)
+
+    #     # get all previous simulations
+    #     starting_round = 0  # NOTE: won't work for SNPE_A, but we don't use it
+    #     x, _, _ = model.get_simulations(starting_round)
+
+    #     # split into training and validation randomly
+    #     num_examples = x.shape[0]
+    #     permuted_indices = torch.randperm(num_examples)
+    #     num_training_examples = int(
+    #         (1 - self.train_args['validation_fraction']) * num_examples)
+    #     train_indices, val_indices = (
+    #         permuted_indices[:num_training_examples],
+    #         permuted_indices[num_training_examples:],
+    #     )
+
+    #     posteriors, summaries = [], []
+    #     for i, model in enumerate(models):
+    #         logging.info(f"Training model {i+1} / {len(models)}.")
+
+    #         # hack to initialize sbi model without training (ref. issue #127)
+    #         first_round = False
+    #         if model._neural_net is None:
+    #             model.train(learning_rate=self.train_args['learning_rate'],
+    #                         resume_training=False,
+    #                         max_num_epochs=-1)
+    #             model._epochs_since_last_improvement = 0
+    #             first_round = True
+
+    #         # set train/validation splits
+    #         model.train_indices = train_indices
+    #         model.val_indices = val_indices
+
+    #         # train
+    #         if ("NPE" in self.engine) & first_round:
+    #             model.train(**self.train_args, resume_training=True,
+    #                         force_first_round_loss=True)
+    #         else:
+    #             model.epoch, model._val_log_prob = 0, float("-Inf")
+    #             model.train(**self.train_args,  resume_training=True)
+
+    #         # duplicate loss record (for backwards compatibility)
+    #         # this is a mess, sorry
+    #         # TODO: deprecate in future versions
+    #         if "training_log_probs" in model.summary:
+    #             model.summary["training_loss"] = \
+    #                 [-1.*x for x in model.summary["training_log_probs"]]
+    #             model.summary["validation_loss"] = \
+    #                 [-1.*x for x in model.summary["validation_log_probs"]]
+    #             model.summary["best_validation_loss"] = \
+    #                 [-1.*x for x in model.summary["best_validation_log_prob"]]
+    #         else:
+    #             model.summary["training_log_probs"] = \
+    #                 [-1.*x for x in model.summary["training_loss"]]
+    #             model.summary["validation_log_probs"] = \
+    #                 [-1.*x for x in model.summary["validation_loss"]]
+    #             model.summary["best_validation_log_prob"] = \
+    #                 [-1.*x for x in model.summary["best_validation_loss"]]
+
+    #         # save model
+    #         posteriors.append(model.build_posterior())
+    #         summaries.append(model.summary)
+
+    #     # ensemble all trained models, weighted by validation loss
+    #     val_logprob = torch.tensor(
+    #         [-1.*float(x["best_validation_loss"][-1]) for x in summaries]).to(self.device)
+
+    #     # Exponentiate with numerical stability
+    #     weights = torch.exp(val_logprob - val_logprob.max())
+    #     weights /= weights.sum()
+    #     posterior_ensemble = EnsemblePosterior(
+    #         posteriors=posteriors,
+    #         weights=weights,
+    #         theta_transform=posteriors[0].theta_transform
+    #     )  # raises warning due to bug in sbi
+
+    #     # record the name of the ensemble
+    #     posterior_ensemble.name = self.name
+    #     posterior_ensemble.signatures = self.signatures
+
+    #     return posterior_ensemble, summaries
 
     def _save_models(self, posterior_ensemble: EnsemblePosterior,
                      summaries: List[Dict]):
