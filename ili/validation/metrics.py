@@ -19,10 +19,7 @@ from ili.utils.samplers import (EmceeSampler, PyroSampler,
 try:
     from sbi.inference.posteriors.base_posterior import NeuralPosterior
     from sbi.inference.posteriors import DirectPosterior
-    try:  # sbi > 0.22.0
-        from sbi.inference.posteriors import EnsemblePosterior
-    except ImportError:  # sbi < 0.22.0
-        from sbi.utils.posterior_ensemble import NeuralPosteriorEnsemble as EnsemblePosterior
+    from sbi.utils.posterior_ensemble import NeuralPosteriorEnsemble
     from ili.utils.ndes_pt import LampeNPE, LampeEnsemble
     ModelClass = NeuralPosterior
     backend = 'torch'
@@ -99,9 +96,9 @@ class _SampleBasedMetric(_BaseMetric):
 
         # check if DirectPosterior is available
         if self.sample_method == 'direct':
-            # First case: we have a EnsemblePosterior instance
+            # First case: we have a NeuralPosteriorEnsemble instance
             # We only need to check the first element
-            if (isinstance(posterior, EnsemblePosterior) and
+            if (isinstance(posterior, NeuralPosteriorEnsemble) and
                     isinstance(posterior.posteriors[0], DirectPosterior)):
                 return DirectSampler(posterior)
             # Second case (when ValidationRunner.ensemble_mode = False)
@@ -366,7 +363,7 @@ class PosteriorCoverage(PosteriorSamples):
             trues (np.array): true parameters of shape (ndata, npars)
 
         Returns:
-            np.array: ranks of the true parameters in the posterior samples 
+            np.array: ranks of the true parameters in the posterior samples
                 of shape (ndata, npars)
         """
         ranks = (samples < trues[None, ...]).sum(axis=0)
@@ -495,16 +492,48 @@ class PosteriorCoverage(PosteriorSamples):
             axs = [axs]
         else:
             axs = axs.flatten()
+        # for j in range(npars):
+        #     axs[j].errorbar(trues[:, j], mus[:, j], stds[:, j],
+        #                     fmt="none", elinewidth=0.5, alpha=0.5)
+        #     axs[j].plot(
+        #         *(2 * [np.linspace(min(trues[:, j]), max(trues[:, j]), 10)]),
+        #         'k--', ms=0.2, lw=0.5)
+        #     axs[j].grid(which='both', lw=0.5)
+        #     axs[j].set(adjustable='box', aspect='equal')
+        #     axs[j].set_title(self.labels[j], fontsize=12)
+        #     axs[j].set_xlabel('True')
+
+        ### modified to color points by sample size
+        # Compute sample sizes (sum over histogram bins)
+        sample_sizes = samples.sum(axis=(1, 2, 3)) if samples.ndim == 4 else samples.sum(axis=1)
         for j in range(npars):
-            axs[j].errorbar(trues[:, j], mus[:, j], stds[:, j],
-                            fmt="none", elinewidth=0.5, alpha=0.5)
-            axs[j].plot(
-                *(2 * [np.linspace(min(trues[:, j]), max(trues[:, j]), 10)]),
-                'k--', ms=0.2, lw=0.5)
-            axs[j].grid(which='both', lw=0.5)
-            axs[j].set(adjustable='box', aspect='equal')
-            axs[j].set_title(self.labels[j], fontsize=12)
-            axs[j].set_xlabel('True')
+            # Color points by sample size
+            sc = axs[j].scatter(
+                trues[:, j], mus[:, j],
+                c=sample_sizes,
+                s=20, alpha=0.7,
+                cmap='viridis',
+                norm=plt.colors.LogNorm(vmin=sample_sizes.min(), vmax=sample_sizes.max())
+            )
+
+            # Error bars (optional, can clutter the plot)
+            for i in range(len(trues)):
+                axs[j].plot(
+                    [trues[i, j], trues[i, j]],
+                    [mus[i, j] - stds[i, j], mus[i, j] + stds[i, j]],
+                    color='gray', alpha=0.2, lw=0.5
+                )
+
+            # Diagonal line
+            xmin, xmax = trues[:, j].min(), trues[:, j].max()
+            axs[j].plot([xmin, xmax], [xmin, xmax], 'k--', lw=1)
+            axs[j].grid(lw=0.5)
+            axs[j].set(aspect='equal', title=self.labels[j], xlabel='True')
+
+        # Add colorbar
+        fig.colorbar(sc, ax=axs, label='Sample Size', shrink=0.6)
+
+
         axs[0].set_ylabel('Predicted')
 
         if self.out_dir is None:
@@ -529,11 +558,11 @@ class PosteriorCoverage(PosteriorSamples):
             posterior_samples (np.array): Array of posterior samples.
             theta (np.array): Array of theta values.
             signature (str): Signature for the plot.
-            references (str, optional): TARP reference type for TARP calculation. 
+            references (str, optional): TARP reference type for TARP calculation.
                 Defaults to "random".
-            metric (str, optional): TARP distance metric for TARP calculation. 
+            metric (str, optional): TARP distance metric for TARP calculation.
                 Defaults to "euclidean".
-            bootstrap (bool, optional): Whether to use bootstrapping for TARP error bars. 
+            bootstrap (bool, optional): Whether to use bootstrapping for TARP error bars.
                 Defaults to False.
             norm (bool, optional): Whether to normalize the TARP metric. Defaults to True.
             num_alpha_bins (int, optional):number of bins to use for the TARP
